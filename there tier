@@ -1,0 +1,180 @@
+#include "ns3/mobility-module.h"
+#include "ns3/nstime.h"
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/ipv4-global-routing-helper.h"
+#include "ns3/netanim-module.h"
+#include "ns3/flow-monitor-helper.h"
+#include "ns3/flow-monitor-module.h"
+
+#define TCP_SINK_PORT 9000
+#define UDP_SINK_PORT 9001
+#define MAX_BULK_BYTES 100000
+#define DDOS_RATE "1Mb/s"
+#define MAX_SIMULATION_TIME 1
+#define NUMBER_OF_BOTS 100
+#define NUMBER_OF_EXTRA_NODES 4
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("ThreeTierDDoS");
+
+int main(int argc, char *argv[])
+{
+    CommandLine cmd;
+    cmd.Parse(argc, argv);
+
+    Time::SetResolution(Time::NS);
+    LogComponentEnable("UdpEchoClientApplication", LOG_LEVEL_INFO);
+    LogComponentEnable("UdpEchoServerApplication", LOG_LEVEL_INFO);
+
+    // Core Layer nodes (2 nodes)
+    NodeContainer coreNodes;
+    coreNodes.Create(2);
+
+    // Distribution Layer nodes (2 nodes)
+    NodeContainer distributionNodes;
+    distributionNodes.Create(2);
+
+    // Access Layer nodes for legitimate users (2 nodes) and DDoS bots
+    NodeContainer accessNodes;
+    accessNodes.Create(2); 
+
+    NodeContainer botNodes;
+    botNodes.Create(NUMBER_OF_BOTS);
+
+    NodeContainer extraNodes;
+    extraNodes.Create(NUMBER_OF_EXTRA_NODES);
+
+    // Define the Point-To-Point Links and their Parameters
+    PointToPointHelper p2pCore, p2pDistribution, p2pAccess, p2pBot, p2pExtra;
+    p2pCore.SetDeviceAttribute("DataRate", StringValue("10Gbps"));
+    p2pCore.SetChannelAttribute("Delay", StringValue("2ms"));
+
+    p2pDistribution.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
+    p2pDistribution.SetChannelAttribute("Delay", StringValue("2ms"));
+
+    p2pAccess.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    p2pAccess.SetChannelAttribute("Delay", StringValue("2ms"));
+
+    p2pBot.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    p2pBot.SetChannelAttribute("Delay", StringValue("5ms"));
+
+    p2pExtra.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    p2pExtra.SetChannelAttribute("Delay", StringValue("2ms"));
+
+    // Install the connections between Core and Distribution layers
+    NetDeviceContainer coreDevices, distributionDevices;
+    coreDevices = p2pCore.Install(coreNodes.Get(0), coreNodes.Get(1));
+    distributionDevices = p2pDistribution.Install(distributionNodes.Get(0), distributionNodes.Get(1));
+
+    // Core to Distribution connections
+    NetDeviceContainer coreToDistribution1 = p2pCore.Install(coreNodes.Get(0), distributionNodes.Get(0));
+    NetDeviceContainer coreToDistribution2 = p2pCore.Install(coreNodes.Get(1), distributionNodes.Get(1));
+
+    // Install connections between Distribution and Access layers
+    NetDeviceContainer distToAccess1 = p2pAccess.Install(distributionNodes.Get(0), accessNodes.Get(0));
+    NetDeviceContainer distToAccess2 = p2pAccess.Install(distributionNodes.Get(1), accessNodes.Get(1));
+
+    // Connect bot nodes to access node 1
+    NetDeviceContainer botDevices[NUMBER_OF_BOTS];
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        botDevices[i] = p2pBot.Install(botNodes.Get(i), accessNodes.Get(0));
+    }
+
+    // Connect extra nodes to access node 2
+    NetDeviceContainer extraDevices[NUMBER_OF_EXTRA_NODES];
+    for (int i = 0; i < NUMBER_OF_EXTRA_NODES; ++i)
+    {
+        extraDevices[i] = p2pExtra.Install(extraNodes.Get(i), accessNodes.Get(1));
+    }
+
+    // IP addresses for Core, Distribution, and Access Layers
+    InternetStackHelper stack;
+    stack.Install(coreNodes);
+    stack.Install(distributionNodes);
+    stack.Install(accessNodes);
+    stack.Install(botNodes);
+    stack.Install(extraNodes);
+
+    Ipv4AddressHelper ipv4;
+    ipv4.SetBase("10.1.1.0", "255.255.255.0");
+    Ipv4InterfaceContainer coreInterfaces = ipv4.Assign(coreDevices);
+
+    ipv4.SetBase("10.1.2.0", "255.255.255.0");
+    Ipv4InterfaceContainer distributionInterfaces = ipv4.Assign(distributionDevices);
+
+    ipv4.SetBase("10.1.3.0", "255.255.255.0");
+    Ipv4InterfaceContainer coreDist1Interfaces = ipv4.Assign(coreToDistribution1);
+
+    ipv4.SetBase("10.1.4.0", "255.255.255.0");
+    Ipv4InterfaceContainer coreDist2Interfaces = ipv4.Assign(coreToDistribution2);
+
+    ipv4.SetBase("10.1.5.0", "255.255.255.0");
+    Ipv4InterfaceContainer access1Interfaces = ipv4.Assign(distToAccess1);
+
+    ipv4.SetBase("10.1.6.0", "255.255.255.0");
+    Ipv4InterfaceContainer access2Interfaces = ipv4.Assign(distToAccess2);
+
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        ipv4.SetBase("10.1.7.0", "255.255.255.0");
+        ipv4.Assign(botDevices[i]);
+    }
+
+    for (int i = 0; i < NUMBER_OF_EXTRA_NODES; ++i)
+    {
+        ipv4.SetBase("10.1.8.0", "255.255.255.0");
+        ipv4.Assign(extraDevices[i]);
+    }
+
+    // DDoS bots attacking a UDP sink at access node 1
+    OnOffHelper ddos("ns3::UdpSocketFactory", InetSocketAddress(access1Interfaces.GetAddress(1), UDP_SINK_PORT));
+    ddos.SetConstantRate(DataRate(DDOS_RATE));
+
+    ApplicationContainer ddosApps;
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        ddosApps.Add(ddos.Install(botNodes.Get(i)));
+    }
+    ddosApps.Start(Seconds(0.0));
+    ddosApps.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    // Legitimate traffic: TCP BulkSend from access node 2 to UDP sink on node 1
+    BulkSendHelper bulkSend("ns3::TcpSocketFactory", InetSocketAddress(access1Interfaces.GetAddress(1), TCP_SINK_PORT));
+    bulkSend.SetAttribute("MaxBytes", UintegerValue(MAX_BULK_BYTES));
+    ApplicationContainer bulkSendApp = bulkSend.Install(extraNodes.Get(0));
+    bulkSendApp.Start(Seconds(0.0));
+    bulkSendApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    // UDP sink to receive traffic
+    PacketSinkHelper udpSink("ns3::UdpSocketFactory", Address(InetSocketAddress(Ipv4Address::GetAny(), UDP_SINK_PORT)));
+    ApplicationContainer udpSinkApp = udpSink.Install(accessNodes.Get(0));
+    udpSinkApp.Start(Seconds(0.0));
+    udpSinkApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    // TCP Sink to receive bulk send traffic
+    PacketSinkHelper tcpSink("ns3::TcpSocketFactory", Address(InetSocketAddress(Ipv4Address::GetAny(), TCP_SINK_PORT)));
+    ApplicationContainer tcpSinkApp = tcpSink.Install(accessNodes.Get(0));
+    tcpSinkApp.Start(Seconds(0.0));
+    tcpSinkApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
+    // Mobility model for the nodes
+    MobilityHelper mobility;
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+
+    // Animation interface
+    AnimationInterface anim("three-tier-simulation.xml");
+
+    Simulator::Stop(Seconds(MAX_SIMULATION_TIME));
+    Simulator::Run();
+    Simulator::Destroy();
+
+    return 0;
+}
