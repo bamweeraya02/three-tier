@@ -1,0 +1,186 @@
+#include "ns3/mobility-module.h"
+#include "ns3/nstime.h"
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/ipv4-global-routing-helper.h"
+#include "ns3/netanim-module.h"
+#include "ns3/flow-monitor.h"
+#include "ns3/flow-monitor-helper.h"
+
+#define TCP_SINK_PORT 9000
+#define UDP_SINK_PORT 9001
+
+#define MAX_BULK_BYTES 100000
+#define DDOS_RATE "1Mb/s"
+#define MAX_SIMULATION_TIME 1
+
+#define NUMBER_OF_BOTS 100
+#define NUMBER_OF_EXTRA_NODES 4
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("DDoSAttack");
+
+int main(int argc, char *argv[])
+{
+    CommandLine cmd;
+    cmd.Parse(argc, argv);
+
+    Time::SetResolution(Time::NS);
+    LogComponentEnable("UdpEchoClientApplication", LOG_LEVEL_INFO);
+    LogComponentEnable("UdpEchoServerApplication", LOG_LEVEL_INFO);
+
+    // Nodes for the three-tier topology
+    NodeContainer coreNodes;
+    coreNodes.Create(2);  // Core layer with 2 nodes
+
+    NodeContainer aggNodes;
+    aggNodes.Create(4);  // Aggregation layer with 4 nodes
+
+    NodeContainer accessNodes;
+    accessNodes.Create(6);  // Access layer with 6 nodes (users and servers)
+
+    // Bot nodes for the DDoS attack
+    NodeContainer botNodes;
+    botNodes.Create(NUMBER_OF_BOTS);
+
+    // Extra nodes for additional users
+    NodeContainer extraNodes;
+    extraNodes.Create(NUMBER_OF_EXTRA_NODES);
+
+    // Point-to-point links
+    PointToPointHelper p2pCoreToAgg, p2pAggToAccess, p2pAccess, p2pBot;
+    p2pCoreToAgg.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    p2pCoreToAgg.SetChannelAttribute("Delay", StringValue("2ms"));
+
+    p2pAggToAccess.SetDeviceAttribute("DataRate", StringValue("50Mbps"));
+    p2pAggToAccess.SetChannelAttribute("Delay", StringValue("1ms"));
+
+    p2pAccess.SetDeviceAttribute("DataRate", StringValue("20Mbps"));
+    p2pAccess.SetChannelAttribute("Delay", StringValue("1ms"));
+
+    p2pBot.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    p2pBot.SetChannelAttribute("Delay", StringValue("1ms"));
+
+    // Install Internet stack
+    InternetStackHelper stack;
+    stack.Install(coreNodes);
+    stack.Install(aggNodes);
+    stack.Install(accessNodes);
+    stack.Install(botNodes);
+    stack.Install(extraNodes);
+
+    // Connect Core to Aggregation layer
+    NetDeviceContainer dCoreAgg[4];
+    for (int i = 0; i < 2; i++)
+    {
+        dCoreAgg[i] = p2pCoreToAgg.Install(coreNodes.Get(0), aggNodes.Get(i));
+        dCoreAgg[i + 2] = p2pCoreToAgg.Install(coreNodes.Get(1), aggNodes.Get(i + 2));
+    }
+
+    // Connect Aggregation to Access layer
+    NetDeviceContainer dAggAccess[6];
+    for (int i = 0; i < 4; i++)
+    {
+        dAggAccess[i] = p2pAggToAccess.Install(aggNodes.Get(i), accessNodes.Get(i));
+    }
+
+    // Connect bots to an access node (DDoS targets)
+    NetDeviceContainer botDevices[NUMBER_OF_BOTS];
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        botDevices[i] = p2pBot.Install(botNodes.Get(i), accessNodes.Get(0));
+    }
+
+    // Connect extra user nodes to other access nodes
+    NetDeviceContainer extraDevices[NUMBER_OF_EXTRA_NODES];
+    for (int i = 0; i < NUMBER_OF_EXTRA_NODES; ++i)
+    {
+        extraDevices[i] = p2pAccess.Install(extraNodes.Get(i), accessNodes.Get(1 + i));
+    }
+
+    // Assign IP addresses
+    Ipv4AddressHelper ipv4;
+    ipv4.SetBase("10.0.0.0", "255.255.255.0");
+    Ipv4InterfaceContainer coreInterfaces, aggInterfaces, accessInterfaces, botInterfaces, extraInterfaces;
+
+    for (int i = 0; i < 4; i++)
+    {
+        ipv4.Assign(dCoreAgg[i]);
+        ipv4.NewNetwork();
+    }
+
+    for (int i = 0; i < 4; i++)
+    {
+        ipv4.Assign(dAggAccess[i]);
+        ipv4.NewNetwork();
+    }
+
+    for (int i = 0; i < NUMBER_OF_BOTS; i++)
+    {
+        botInterfaces.Add(ipv4.Assign(botDevices[i]));
+        ipv4.NewNetwork();
+    }
+
+    for (int i = 0; i < NUMBER_OF_EXTRA_NODES; i++)
+    {
+        extraInterfaces.Add(ipv4.Assign(extraDevices[i]));
+        ipv4.NewNetwork();
+    }
+
+    // DDoS traffic (UDP)
+    OnOffHelper onoff("ns3::UdpSocketFactory", Address(InetSocketAddress(accessInterfaces.GetAddress(0), UDP_SINK_PORT)));
+    onoff.SetConstantRate(DataRate(DDOS_RATE));
+    ApplicationContainer onOffApp[NUMBER_OF_BOTS];
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        onOffApp[i] = onoff.Install(botNodes.Get(i));
+        onOffApp[i].Start(Seconds(0.0));
+        onOffApp[i].Stop(Seconds(MAX_SIMULATION_TIME));
+    }
+
+    // Legitimate TCP traffic
+    BulkSendHelper bulkSend("ns3::TcpSocketFactory", InetSocketAddress(accessInterfaces.GetAddress(0), TCP_SINK_PORT));
+    bulkSend.SetAttribute("MaxBytes", UintegerValue(MAX_BULK_BYTES));
+    ApplicationContainer bulkSendApp = bulkSend.Install(extraNodes.Get(0));
+    bulkSendApp.Start(Seconds(0.0));
+    bulkSendApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    // Packet sinks for TCP and UDP traffic
+    PacketSinkHelper TCPsink("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), TCP_SINK_PORT));
+    PacketSinkHelper UDPsink("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), UDP_SINK_PORT));
+
+    ApplicationContainer TCPSinkApp = TCPsink.Install(accessNodes.Get(0));
+    ApplicationContainer UDPSinkApp = UDPsink.Install(accessNodes.Get(0));
+
+    TCPSinkApp.Start(Seconds(0.0));
+    TCPSinkApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    UDPSinkApp.Start(Seconds(0.0));
+    UDPSinkApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    // Populate routing tables
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
+    // Setup mobility for visualization in NetAnim
+    MobilityHelper mobility;
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    mobility.Install(coreNodes);
+    mobility.Install(aggNodes);
+    mobility.Install(accessNodes);
+    mobility.Install(botNodes);
+    mobility.Install(extraNodes);
+
+    AnimationInterface anim("ThreeTierDDoS.xml");
+    anim.UpdateNodeSize(coreNodes.Get(0)->GetId(), 10, 10);
+
+    // Start simulation
+    Simulator::Stop(Seconds(MAX_SIMULATION_TIME));
+    Simulator::Run();
+    Simulator::Destroy();
+
+    return 0;
+}
