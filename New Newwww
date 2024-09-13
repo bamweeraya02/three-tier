@@ -1,0 +1,209 @@
+#include "ns3/mobility-module.h"
+#include "ns3/nstime.h"
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/ipv4-global-routing-helper.h"
+#include "ns3/netanim-module.h"
+#include "ns3/flow-monitor.h"
+#include "ns3/flow-monitor-helper.h"
+#include "ns3/flow-monitor-module.h"
+
+#define TCP_SINK_PORT 9000
+#define UDP_SINK_PORT 9001
+
+// Experimental parameters
+#define MAX_BULK_BYTES 100000
+#define DDOS_RATE "1Mb/s"
+#define MAX_SIMULATION_TIME 1
+
+// Number of Bots for DDoS
+#define NUMBER_OF_BOTS 100
+#define NUMBER_OF_EXTRA_NODES 4  // จำนวนโหนด user ใหม่
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("DDoSAttack");
+
+int main(int argc, char *argv[])
+{
+    CommandLine cmd;
+    cmd.Parse(argc, argv);
+
+    Time::SetResolution(Time::NS);
+    LogComponentEnable("UdpEchoClientApplication", LOG_LEVEL_INFO);
+    LogComponentEnable("UdpEchoServerApplication", LOG_LEVEL_INFO);
+
+    // Legitimate connection nodes (4 nodes)
+    NodeContainer coreNodes, aggNodes, accessNodes;
+    coreNodes.Create(2);  // Two core nodes
+    aggNodes.Create(2);   // Two aggregation nodes
+    accessNodes.Create(4);  // Four access nodes (similar to original legitimate connection)
+
+    // Nodes for attack bots
+    NodeContainer botNodes;
+    botNodes.Create(NUMBER_OF_BOTS);
+
+    // Nodes for extra users
+    NodeContainer extraNodes;
+    extraNodes.Create(NUMBER_OF_EXTRA_NODES);  // สร้างโหนด user ใหม่ 4 โหนด
+
+    // Define the Point-To-Point Links and their Parameters
+    PointToPointHelper coreLink, aggLink, accessLink;
+    coreLink.SetDeviceAttribute("DataRate", StringValue("10Gbps"));
+    coreLink.SetChannelAttribute("Delay", StringValue("1ms"));
+
+    aggLink.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
+    aggLink.SetChannelAttribute("Delay", StringValue("1ms"));
+
+    accessLink.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    accessLink.SetChannelAttribute("Delay", StringValue("1ms"));
+
+    // Install the Point-To-Point Connections between Nodes in the three-tier topology
+    NetDeviceContainer coreDevices, aggDevices[2], accessDevices[4], botDevices[NUMBER_OF_BOTS], extraDevices[NUMBER_OF_EXTRA_NODES];
+
+    coreDevices = coreLink.Install(coreNodes.Get(0), coreNodes.Get(1));  // Core network
+    for (int i = 0; i < 2; ++i) {
+        aggDevices[i] = aggLink.Install(coreNodes.Get(0), aggNodes.Get(i));  // Aggregation network
+    }
+    for (int i = 0; i < 4; ++i) {
+        accessDevices[i] = accessLink.Install(aggNodes.Get(i / 2), accessNodes.Get(i));  // Access network
+    }
+
+    // Bot nodes connect to legitimate access nodes
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        botDevices[i] = accessLink.Install(botNodes.Get(i), accessNodes.Get(0));  // Bots connect to access node 0
+    }
+
+    // Extra nodes connections (new connection between extra nodes and access node 1)
+    for (int i = 0; i < NUMBER_OF_EXTRA_NODES; ++i)
+    {
+        extraDevices[i] = accessLink.Install(accessNodes.Get(1), extraNodes.Get(i));
+    }
+
+    // Enable packet capture for Wireshark
+    coreLink.EnablePcapAll("core_traffic/core");
+    aggLink.EnablePcapAll("agg_traffic/agg");
+    accessLink.EnablePcapAll("access_traffic/access");
+
+    // Assign IP addresses to legitimate nodes and bots
+    InternetStackHelper stack;
+    stack.Install(coreNodes);
+    stack.Install(aggNodes);
+    stack.Install(accessNodes);
+    stack.Install(botNodes);
+    stack.Install(extraNodes);
+
+    Ipv4AddressHelper ipv4;
+    ipv4.SetBase("10.0.0.0", "255.255.255.252");
+
+    Ipv4InterfaceContainer coreInterfaces, aggInterfaces[2], accessInterfaces[4], botInterfaces[NUMBER_OF_BOTS], extraInterfaces[NUMBER_OF_EXTRA_NODES];
+
+    coreInterfaces = ipv4.Assign(coreDevices);
+
+    for (int i = 0; i < 2; ++i)
+    {
+        ipv4.NewNetwork();
+        aggInterfaces[i] = ipv4.Assign(aggDevices[i]);
+    }
+
+    for (int i = 0; i < 4; ++i)
+    {
+        ipv4.NewNetwork();
+        accessInterfaces[i] = ipv4.Assign(accessDevices[i]);
+    }
+
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        ipv4.NewNetwork();
+        botInterfaces[i] = ipv4.Assign(botDevices[i]);
+    }
+
+    for (int i = 0; i < NUMBER_OF_EXTRA_NODES; ++i)
+    {
+        ipv4.NewNetwork();
+        extraInterfaces[i] = ipv4.Assign(extraDevices[i]);
+    }
+
+    // DDoS Application Behaviour
+    OnOffHelper onoff("ns3::UdpSocketFactory", Address(InetSocketAddress(accessInterfaces[3].GetAddress(1), UDP_SINK_PORT)));
+    onoff.SetConstantRate(DataRate(DDOS_RATE));
+    onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=30]"));
+    onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+
+    ApplicationContainer onOffApp[NUMBER_OF_BOTS];
+
+    // Install application on all bots
+    for (int k = 0; k < NUMBER_OF_BOTS; ++k)
+    {
+        onOffApp[k] = onoff.Install(botNodes.Get(k));
+        onOffApp[k].Start(Seconds(0.0));
+        onOffApp[k].Stop(Seconds(MAX_SIMULATION_TIME));
+    }
+
+    // Legitimate TCP traffic application (BulkSend) on node 0 in access layer
+    BulkSendHelper bulkSend("ns3::TcpSocketFactory", InetSocketAddress(accessInterfaces[3].GetAddress(1), TCP_SINK_PORT));
+    bulkSend.SetAttribute("MaxBytes", UintegerValue(MAX_BULK_BYTES));
+    ApplicationContainer bulkSendApp = bulkSend.Install(accessNodes.Get(0));
+    bulkSendApp.Start(Seconds(0.0));
+    bulkSendApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    // BulkSend on extra nodes to send TCP data to access node 3
+    BulkSendHelper extraBulkSend("ns3::TcpSocketFactory", InetSocketAddress(accessInterfaces[3].GetAddress(1), TCP_SINK_PORT));
+    extraBulkSend.SetAttribute("MaxBytes", UintegerValue(MAX_BULK_BYTES));
+    ApplicationContainer extraBulkSendApp[NUMBER_OF_EXTRA_NODES];
+
+    for (int k = 0; k < NUMBER_OF_EXTRA_NODES; ++k)
+    {
+        extraBulkSendApp[k] = extraBulkSend.Install(extraNodes.Get(k));
+        extraBulkSendApp[k].Start(Seconds(0.0));
+        extraBulkSendApp[k].Stop(Seconds(MAX_SIMULATION_TIME));
+    }
+
+    // UDPSink on the receiver side
+    PacketSinkHelper UDPsink("ns3::UdpSocketFactory", Address(InetSocketAddress(Ipv4Address::GetAny(), UDP_SINK_PORT)));
+    ApplicationContainer UDPSinkApp = UDPsink.Install(accessNodes.Get(3));  // ติดตั้งบน access node 3
+    UDPSinkApp.Start(Seconds(0.0));
+    UDPSinkApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    // TCP Sink Application on the server side
+    PacketSinkHelper TCPsink("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), TCP_SINK_PORT));
+    ApplicationContainer TCPSinkApp = TCPsink.Install(accessNodes.Get(3));  // ติดตั้งบน access node 3
+    TCPSinkApp.Start(Seconds(0.0));
+    TCPSinkApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
+    // Simulation NetAnim configuration and node placement
+    MobilityHelper mobility;
+
+    mobility.SetPositionAllocator("ns3::GridPositionAllocator",
+                                  "MinX", DoubleValue(0.0), "MinY", DoubleValue(0.0),
+                                  "DeltaX", DoubleValue(5.0), "DeltaY", DoubleValue(10.0),
+                                  "GridWidth", UintegerValue(5), "LayoutType", StringValue("RowFirst"));
+
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    mobility.Install(coreNodes);
+    mobility.Install(aggNodes);
+    mobility.Install(accessNodes);
+    mobility.Install(botNodes);
+    mobility.Install(extraNodes);  // ติดตั้งตำแหน่งโหนด user ใหม่
+
+    AnimationInterface anim("DDoSim-test.xml");
+
+    // Load icons into NetAnim
+    uint32_t node0Icon = anim.AddResource("ns-allinone-3.42/ns-3.42/scratch/server.jpg");
+    anim.UpdateNodeDescription(accessNodes.Get(3), "Server");
+    anim.UpdateNodeSize(accessNodes.Get(3)->GetId(), 10, 10);
+    anim.UpdateNodeImage(accessNodes.Get(3)->GetId(), node0Icon);
+
+    // Run simulation and clean up
+    Simulator::Stop(Seconds(MAX_SIMULATION_TIME));
+    Simulator::Run();
+    Simulator::Destroy();
+
+    return 0;
+}
